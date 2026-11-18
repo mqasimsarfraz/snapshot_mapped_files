@@ -1,0 +1,8 @@
+name: "snapshot_mapped_files"
+description: Show currently running processes
+homepageURL: https://github.com/mqasimsarfraz/snapshot_mapped_files
+documentationURL: https://github.com/mqasimsarfraz/snapshot_mapped_files#readme
+sourceURL: https://github.com/mqasimsarfraz/snapshot_mapped_files
+datasources:
+  processes:
+    fields: {}
