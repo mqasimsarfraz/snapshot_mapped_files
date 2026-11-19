@@ -1,16 +1,19 @@
 # snapshot_mapped_files
 
-Show currently running processes with an Inspektor Gadget **iterator
-(snapshotter)**. Unlike event tracing, this reads kernel state, including
-processes that already existed when collection began.
+Snapshot files mapped by running processes with Inspektor Gadget's
+`iter/task_vma` support. This includes mappings whose file descriptors have
+already been closed, such as loaded shared libraries.
 
 ## Requirements
 
-- Linux 5.10 or later with BTF (`/sys/kernel/btf/vmlinux`) and BPF task iterators.
-- IG v0.58.0 and Docker for the default containerized build.
-- Root privileges to build/run with the supplied Makefile.
+- Linux with BTF (`/sys/kernel/btf/vmlinux`), `task_vma` iterators, and
+  `bpf_d_path` support for that iterator.
+- An IG runtime containing the framework's `task_vma` support; stock v0.58.0
+  does not support this gadget's iterator.
+- Docker for the default build using the v0.58.0 builder image.
+- Root privileges to run with the supplied Makefile.
 
-The starter is tested with IG v0.58.0, its matching builder image, and Linux 6.8.
+Tested with the locally patched IG runtime and Linux 6.8.
 The kernel must enable `CONFIG_BPF_SYSCALL`, `CONFIG_DEBUG_INFO_BTF`, and
 `CONFIG_BPF_ITER`.
 
@@ -23,7 +26,7 @@ sleep_pid=$!
 PARAMS="--host --pid $sleep_pid --timeout 3 -o json" make run-local
 ```
 
-Expect a `processes` record for the existing sleep process. The session stops
+Expect `mapped_files` rows for the sleep binary and its libraries. The session stops
 after three seconds; clean up with `kill "$sleep_pid"`.
 
 `make run-local` builds the current sources, then runs the unsigned local image
@@ -59,24 +62,48 @@ pulls. To enable signing, configure the optional `COSIGN_PRIVATE_KEY` and
 images. See [Signing and verifying gadgets](SIGNING.md) for setup and public-key
 configuration for `ig`, `kubectl gadget deploy`, and Helm.
 
-## Customize
+## Understanding the output
 
-`GADGET_ITER(processes, gadget_process, ...)` registers the `iter/task` program.
-Use `GADGET_ITER`, not the deprecated `GADGET_SNAPSHOTTER` macro. Inspect other
-supported kernel iterator hooks when extending the program; this is not
-`GADGET_MAPITER`, which drains an aggregation map.
+Each snapshot produces one row per **process lifetime + mount namespace +
+device/inode + permissions**. For example, the same library can appear as
+`r--p`, `r-xp`, and `rw-p`: those are different mappings, not duplicate files.
+`p` means private and `s` means shared.
 
-Keep the null-task check: the kernel also calls the iterator at the end of a
-sequence. Preserve zero-initialization, CO-RE reads, and IG filtering.
-`--pid`, `--comm`, and container filters restrict collected processes. Mount
-namespace information enables enrichment when runtime metadata is available.
-`--host` includes host processes; without it, IG collects from containers by
-default. `--trace-pipe` exposes helper-failure diagnostics.
+- `mapping_count` counts distinct VMAs with the same identity and permissions.
+- `mapped_bytes` sums their virtual sizes, not resident memory or unique file bytes.
+- `dev_major`, `dev_minor`, and `inode` identify the backing file; paths alone
+  cannot distinguish an old mapped library from its replacement.
+- `deleted` means the inode has no links or a mapped path was marked deleted.
+  This can indicate a library retained after an upgrade, but does not prove it.
+- `fname` is a representative path. Hard-link aliases are grouped by inode;
+  `path_variants` counts distinct resolved paths.
+- `path_error` is a negative errno when no path could be resolved, for example
+  a path longer than the 4096-byte buffer. The file identity is still reported.
 
-After changing fields, run `make metadata IMAGE_TAG=latest` and review
-`gadget.yaml`. `make check` checks formatting; `make clang-format` fixes it.
-Ordinary `make build` validates metadata without rewriting it.
-The retained initialization workflow safely does nothing on subsequent runs.
+All regular-file mappings are kept by default, including memfd-backed files.
+Mappings without a backing file and non-regular files are skipped. To focus on
+conventional shared-library names:
+
+```bash
+PARAMS="--host --shared-libs-only --timeout 3 -o json" make run-local
+```
+
+This filter matches `.so` and `.so.*` basenames, including deleted paths.
+It is a naming heuristic, not ELF detection: it can miss unusually named
+libraries, unresolved paths, or match files that are not libraries.
+
+`--pid`, `--comm`, and container filters still apply. `--host` includes host
+processes; without it, IG collects from containers by default. Deduplication
+resets for every snapshot; snapshots are not atomic across the node.
+
+**This is an inventory, not a vulnerability scanner.** A mapped file may never
+have been executed. Identifying vulnerable versions requires build-ID/hash
+and package/advisory correlation. Do not inspect only the current pathname:
+it might now refer to a different inode than the mapped file.
+
+`make test` checks formatting and runs the focused Go aggregation tests
+(Go 1.26+). `make clang-format` fixes C formatting. `make build` compiles the
+BPF and WASM programs and validates metadata.
 
 ## License
 

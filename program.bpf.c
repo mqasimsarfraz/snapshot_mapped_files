@@ -9,73 +9,124 @@
 #include <gadget/macros.h>
 #include <gadget/types.h>
 
-GADGET_ITER(processes, gadget_process, gadget_snapshot_process);
+#define GADGET_PATH_MAX 4096
+#define GADGET_S_IFMT 00170000
+#define GADGET_S_IFREG 0100000
+#define GADGET_VM_RWX 0x7
+#define GADGET_VM_MAYSHARE 0x80
 
-/*
- * This starter uses a kernel iterator, not an event probe. Other targets
- * include iter/task_file and iter/tcp, depending on kernel support.
- * Discover candidate iterator contexts in the target kernel's BTF:
- *   sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c |
- *     grep 'struct bpf_iter__'
- * A bpf_iter__<target> context corresponds to SEC("iter/<target>"); see
- * tools/testing/selftests/bpf/progs/bpf_iter* in the kernel source for
- * examples. BTF presence alone does not guarantee attachment support.
- *
- * Keep the GADGET_ITER callback name, SEC(), context type, field reads,
- * and emitted record type in sync; write records to ctx->meta->seq.
- * Tracepoints/kprobes do not provide that iterator output context: choose
- * the tracer or map-iterator starter for event-driven collection instead.
- * Update README requirements; if record fields change, run make metadata
- * and review gadget.yaml.
+struct gadget_mapped_file {
+	gadget_mntns_id mntns_id;
+	gadget_pid pid;
+	gadget_tid tid;
+	__u64 process_start_ns;
+	__u64 inode;
+	__u64 start;
+	__u64 end;
+	__u64 offset_pages;
+	__u32 dev_major;
+	__u32 dev_minor;
+	__u32 flags;
+	__s32 path_error;
+	bool deleted;
+	char comm[TASK_COMM_LEN];
+	char fname[GADGET_PATH_MAX];
+};
+
+/* Large memset calls cannot be lowered to BPF instructions by all builders. */
+static const struct gadget_mapped_file gadget_empty_mapped_file = {};
+
+/* One record per CPU keeps paths off the 512-byte BPF stack without a
+ * capacity-limited deduplication map that could silently lose files.
  */
-SEC("iter/task")
-int gadget_snapshot_process(struct bpf_iter__task *ctx)
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct gadget_mapped_file);
+} gadget_mapped_file_heap SEC(".maps");
+
+GADGET_ITER(mappings, gadget_mapped_file, gadget_snapshot_mapped_file);
+
+SEC("iter/task_vma")
+int gadget_snapshot_mapped_file(struct bpf_iter__task_vma *ctx)
 {
 	struct task_struct *task = ctx->task;
-	/* The whole record is exported, including unused fields and padding. */
-	struct gadget_process process = {};
+	struct vm_area_struct *vma = ctx->vma;
 
-	/* The kernel also calls the iterator with NULL at the end of a
-	 * sequence. */
-	if (!task)
+	if (!vma || !task)
 		return 0;
 
-	/* This task is not necessarily current. Keep CO-RE reads and the
-	 * explicit filter below instead of using current-task population/filter
-	 * helpers.
+	/* Keep the CO-RE direct load: bpf_d_path requires a verifier-trusted
+	 * file pointer, which a bpf_probe_read_kernel-based read would lose.
 	 */
-	process.pid = BPF_CORE_READ(task, tgid);
-	process.tid = BPF_CORE_READ(task, pid);
-	if (process.pid != process.tid)
+	struct file *vm_file = vma->vm_file;
+	if (!vm_file)
+		return 0;
+	struct inode *inode = BPF_CORE_READ(vm_file, f_inode);
+	if ((BPF_CORE_READ(inode, i_mode) & GADGET_S_IFMT) != GADGET_S_IFREG)
 		return 0;
 
-	process.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
-	process.creds.uid = BPF_CORE_READ(task, cred, uid.val);
-	process.creds.gid = BPF_CORE_READ(task, cred, gid.val);
-	if (BPF_CORE_READ_STR_INTO(&process.comm, task, comm) < 0) {
-		bpf_printk("gadget: reading process name failed");
+	/* The iterator's task is not necessarily current. Thread-group leaders
+	 * represent the shared address space once, not once per thread.
+	 */
+	__u32 pid = BPF_CORE_READ(task, tgid);
+	__u32 tid = BPF_CORE_READ(task, pid);
+	if (pid != tid)
+		return 0;
+
+	__u32 zero = 0;
+	struct gadget_mapped_file *event =
+		bpf_map_lookup_elem(&gadget_mapped_file_heap, &zero);
+	if (!event) {
+		bpf_printk("gadget: mapped-file scratch lookup failed");
 		return 0;
 	}
-	if (gadget_should_discard_data(process.mntns_id, process.pid,
-				       process.tid, process.comm,
-				       process.creds.uid, process.creds.gid))
+	if (bpf_probe_read_kernel(event, sizeof(*event),
+				  &gadget_empty_mapped_file)) {
+		bpf_printk("gadget: clearing mapped-file record failed");
+		return 0;
+	}
+	event->pid = pid;
+	event->tid = tid;
+	event->process_start_ns = BPF_CORE_READ(task, start_time);
+	__u32 uid = BPF_CORE_READ(task, cred, uid.val);
+	__u32 gid = BPF_CORE_READ(task, cred, gid.val);
+	event->mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+	if (BPF_CORE_READ_STR_INTO(&event->comm, task, comm) < 0) {
+		bpf_printk("gadget: reading mapped-file process name failed");
+		return 0;
+	}
+	if (gadget_should_discard_data(event->mntns_id, pid, tid, event->comm,
+				       uid, gid))
 		return 0;
 
-	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
-	if (parent) {
-		process.parent.pid = BPF_CORE_READ(parent, tgid);
-		process.parent.tid = BPF_CORE_READ(parent, pid);
-		if (BPF_CORE_READ_STR_INTO(&process.parent.comm, parent, comm) <
-		    0) {
-			bpf_printk("gadget: reading parent name failed");
+	event->inode = BPF_CORE_READ(inode, i_ino);
+	__u32 dev = BPF_CORE_READ(inode, i_sb, s_dev);
+	event->dev_major = dev >> 20;
+	event->dev_minor = dev & ((1U << 20) - 1);
+	event->deleted = BPF_CORE_READ(inode, i_nlink) == 0;
+	event->start = BPF_CORE_READ(vma, vm_start);
+	event->end = BPF_CORE_READ(vma, vm_end);
+	event->offset_pages = BPF_CORE_READ(vma, vm_pgoff);
+	__u64 flags = BPF_CORE_READ(vma, vm_flags);
+	event->flags = flags & GADGET_VM_RWX;
+	if (flags & GADGET_VM_MAYSHARE)
+		event->flags |= 8;
+
+	long ret = bpf_d_path(&vm_file->f_path, event->fname,
+			      sizeof(event->fname));
+	if (ret < 0) {
+		event->path_error = ret;
+		if (bpf_probe_read_kernel(event->fname, sizeof(event->fname),
+					  gadget_empty_mapped_file.fname)) {
+			bpf_printk("gadget: clearing mapped-file path failed");
 			return 0;
 		}
 	}
 
-	/* Preserve output-error checks; --trace-pipe exposes these diagnostics.
-	 */
-	if (bpf_seq_write(ctx->meta->seq, &process, sizeof(process)))
-		bpf_printk("gadget: writing process snapshot failed");
+	if (bpf_seq_write(ctx->meta->seq, event, sizeof(*event)))
+		bpf_printk("gadget: writing mapped-file snapshot failed");
 	return 0;
 }
 

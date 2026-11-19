@@ -1,8 +1,76 @@
 name: "snapshot_mapped_files"
-description: Show currently running processes
+description: Snapshot mapped regular files grouped by process, file identity, and permissions
 homepageURL: https://github.com/mqasimsarfraz/snapshot_mapped_files
 documentationURL: https://github.com/mqasimsarfraz/snapshot_mapped_files#readme
 sourceURL: https://github.com/mqasimsarfraz/snapshot_mapped_files
 datasources:
-  processes:
-    fields: {}
+  mappings:
+    annotations:
+      cli.supported-output-modes: none
+  mapped_files:
+    annotations:
+      description: One row per process lifetime, device/inode, and mapping permissions
+    fields:
+      pid:
+        annotations:
+          description: Host process ID
+          template: pid
+      comm:
+        annotations:
+          description: Process name
+          template: comm
+      fname:
+        annotations:
+          description: Representative mapped-file path, not necessarily the file currently at that path
+          columns.width: 64
+      permissions:
+        annotations:
+          description: VMA read/write/execute permissions and private (p) or shared (s) mode
+          columns.width: 5
+      mapping_count:
+        annotations:
+          description: Number of distinct virtual memory areas in this group
+          columns.width: 8
+      mapped_bytes:
+        annotations:
+          description: Sum of mapped virtual bytes, not resident memory or unique file bytes
+          columns.width: 12
+      deleted:
+        annotations:
+          description: Backing inode has no links or a mapped path was marked deleted
+          columns.width: 7
+      dev_major:
+        annotations:
+          description: Backing filesystem device major number
+          columns.hidden: "true"
+      dev_minor:
+        annotations:
+          description: Backing filesystem device minor number
+          columns.hidden: "true"
+      inode:
+        annotations:
+          description: Backing inode number; use with device numbers, not path, to identify the file
+          columns.width: 12
+      process_start_ns:
+        annotations:
+          description: Task start time in monotonic nanoseconds, used to distinguish reused PIDs
+          columns.hidden: "true"
+      mntns_id:
+        annotations:
+          description: Process mount namespace for container enrichment
+          columns.hidden: "true"
+      path_error:
+        annotations:
+          description: Negative errno if no path could be resolved; zero on success
+          columns.width: 10
+      path_variants:
+        annotations:
+          description: Number of distinct resolved paths observed for this file and permission group
+          columns.hidden: "true"
+params:
+  wasm:
+    shared-libs-only:
+      key: shared-libs-only
+      defaultValue: "false"
+      typeHint: bool
+      description: Only show groups with a .so or .so.* basename (a naming heuristic, not ELF detection)

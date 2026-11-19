@@ -50,4 +50,4 @@ check:
 
 .PHONY: test
 test:
-	@if test -f tests/init.sh; then bash tests/init.sh; else $(MAKE) check; fi
+	@if test -f tests/init.sh; then bash tests/init.sh; else $(MAKE) check && cd go && go test ./...; fi
